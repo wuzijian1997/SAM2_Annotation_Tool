@@ -58,12 +58,6 @@ project/
    └─ sam2.1_hiera_large.pt
 ```
 
-If you don't have SAM2 yet:
-
-```bash
-git clone https://github.com/facebookresearch/segment-anything-2.git sam2
-pip install -e ./sam2
-```
 
 Then download:
 - Config → `configs/sam2.1/sam2.1_hiera_l.yaml`
