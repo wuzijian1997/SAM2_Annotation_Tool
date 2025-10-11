@@ -94,9 +94,9 @@ Your working directory should look like this:
 project/
 ├─ server.py
 ├─ sam2/
-│  └─ build_sam.py
-├─ configs/sam2.1/
-│  └─ sam2.1_hiera_l.yaml
+│  └─ build_sam.py │
+│  └─configs/sam2.1/
+│    └─ sam2.1_hiera_l.yaml
 ├─ checkpoints/
 │  └─ sam2.1_hiera_large.pt
 ├─ videos/               # put your .mp4 files here
