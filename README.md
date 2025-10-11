@@ -28,17 +28,7 @@ conda activate sam2
 pip install fastapi "uvicorn[standard]" numpy pillow opencv-python anyio pydantic==1.*
 ```
 
-### 1.3 Install PyTorch
 
-Choose one version that matches your platform and CUDA setup:
-
-```bash
-# CPU-only build
-# pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# CUDA 12.1 example:
-# pip install torch --index-url https://download.pytorch.org/whl/cu121
-```
 
 💡 Check your CUDA version and select the matching PyTorch command from [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally).
 
