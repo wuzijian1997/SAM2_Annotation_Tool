@@ -4,7 +4,7 @@ An interactive tool for video frame segmentation using SAM2, with support for mu
 It includes a FastAPI backend and a lightweight HTML/JavaScript front-end served locally.
 
 Access the app at 👉 http://localhost:8001/app/index.html
-
+![alt text](image.png)
 ## 🧩 Prerequisites
 
 - Python 3.10–3.11
