@@ -16,6 +16,8 @@ Access the app at 👉 http://localhost:8001/app/index.html
 ### 1.1 Create and activate a virtual environment
 If you haven't created a virtual environment with sam2 installed.
 ```bash
+git clone https://github.com/lala-sean/SAM2_Annotation_Tool.git
+cd SAM2_Annotation_Tool
 conda create -n sam2 python=3.12 
 conda activate sam2
 ```
