@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>🎞️ Video → Frames Browser (Instances + Keypoints)</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 20px; }
+  .row { margin: 10px 0; }
+  label { display:inline-block; width:160px; }
+  #imgContainer { position:relative; display:inline-block; border:1px solid #ddd; background:#f9f9f9; }
+  #preview  { display:block; max-width:80vw; max-height:80vh; z-index:0; position:relative; }
+  #maskLayer{ position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; z-index:1; image-rendering: pixelated; }
+  #overlay  { position:absolute; left:0; top:0; pointer-events:none; z-index:2; }
+  #slider { width:420px; vertical-align: middle; }
+  button { margin-left: 6px; }
+  select, input[type="text"], input[type="number"] { padding: 2px 4px; }
+  .muted { color:#999; }
+  #fatal { display:none; background:#fee; color:#900; padding:8px 12px; border:1px solid #f88; margin-bottom:10px; }
+  .mode-on { background:#6f42c1; color:white; border-color:#6f42c1; }
+  .chip { display:inline-block; padding:2px 6px; border-radius:10px; background:#eee; color:#333; margin-left:6px; font-size:12px; }
+</style>
+</head>
+<body>
+  <div id="fatal"></div>
+  <h2>🎞️ Video → Frames Browser</h2>
+
+  <div class="row">
+    <label>Server URL</label>
+    <input id="serverUrl" value="http://localhost:8001" style="width:320px"/>
+    <button id="btnRefresh">Refresh videos</button>
+  </div>
+
+  <div class="row">
+    <label>Existing videos</label>
+    <select id="existing" style="width:340px"></select>
+    <button id="btnUse">Use Selected</button>
+  </div>
+
+  <hr/>
+
+  <div class="row">
+    <label>Upload .mp4</label>
+    <input id="videoFile" type="file" accept=".mp4"/>
+    <button id="btnUpload">Upload</button>
+  </div>
+
+  <div class="row">
+    <label>Video ID</label>
+    <input id="videoId" placeholder="auto-filled or choose existing" style="width:320px"/>
+    <button id="btnProcess">Process</button>
+  </div>
+
+  <div class="row">
+    <label>Instance</label>
+    <input id="instanceId" type="number" min="1" step="1" value="1" style="width:80px"/>
+    <span class="muted">切换实例将重置 SAM2 state，并加载该实例的 masks & points & keypoints</span>
+  </div>
+
+  <div class="row">
+    <label>Frames</label>
+    <input id="slider" type="range" min="0" max="0" value="0"/>
+    <span id="idxLabel">0 / 0</span>
+  </div>
+
+  <div class="row">
+    <label>Segmentation Region</label>
+    <select id="region">
+      <option value="overall" selected>overall</option>
+      <option value="shaft">shaft</option>
+      <option value="wrist">wrist</option>
+      <option value="gripper">gripper</option>
+    </select>
+    <span class="muted" style="margin-left:12px;">左键=正(蓝,1)、右键=负(红,0)、Shift+左=负、U=撤销</span>
+  </div>
+
+  <div id="imgContainer">
+    <img id="preview" alt="frame preview"/>
+    <img id="maskLayer" alt="mask overlay"/>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div class="row" style="margin-top:8px;">
+    <button id="btnUndo">Undo</button>
+    <button id="btnClear">Clear (this frame)</button>
+    <button id="btnExport">Export JSON (points)</button>
+    <button id="btnSave">Save Points</button>
+    <button id="btnLoad">Load Points</button>
+    <button id="btnTrack">SAM2 Track</button>
+    <span id="trackStatus" class="muted" style="margin-left:8px;"></span>
+    <span id="counts" class="chip"></span>
+  </div>
+
+  <hr/>
+
+  <div class="row">
+    <label>Keypoints</label>
+    <button id="btnToggleKP">Keypoint Mode: OFF</button>
+    <input id="kpName" placeholder="optional name/label" style="width:200px"/>
+    <button id="btnKPSave">Save Keypoints</button>
+    <button id="btnKPLoad">Load Keypoints</button>
+    <span id="kpCounts" class="chip"></span>
+  </div>
+
+<script>
+/* ===== 页面错误可视化 ===== */
+window.addEventListener('error', e => {
+  const box = document.getElementById('fatal');
+  box.style.display = 'block';
+  box.textContent = 'Front-end error: ' + (e?.error?.stack || e.message || e);
+});
+window.addEventListener('unhandledrejection', e => {
+  const box = document.getElementById('fatal');
+  box.style.display = 'block';
+  box.textContent = 'Unhandled promise rejection: ' + (e?.reason?.stack || e.reason || e);
+});
+
+const $ = id => document.getElementById(id);
+
+/* ===== 全局状态 ===== */
+let numFrames = 0;
+const regions = ["overall","shaft","wrist","gripper"];
+let activeRegion = "overall";
+let instanceId = 1;
+
+const DOT_RADIUS_DISPLAY = 5;
+const KP_RADIUS_DISPLAY  = 5;
+
+const imgEl   = $("preview");
+const maskEl  = $("maskLayer");
+const overlay = $("overlay");
+const ctx     = overlay.getContext("2d");
+
+let keypointMode = false;
+
+/* points: 以 instance × region 组织 */
+const pointsByInstance = {}; // { [instanceId]: { [region]: { [frameIndex]: {pos:[], neg:[]} } } }
+const undoByInstance   = {}; // { [instanceId]: { [region]: [ {frame, type} ] } }
+
+/* keypoints: 以 instance 组织 */
+const keypointsByInstance = {}; // { [instanceId]: [ {frame_index,x,y,name?} ] }
+
+/* ===== 工具函数（取/建结构） ===== */
+function ensureInstanceStruct(id) {
+  if (!pointsByInstance[id]) pointsByInstance[id] = { overall:{}, shaft:{}, wrist:{}, gripper:{} };
+  if (!undoByInstance[id])   undoByInstance[id]   = { overall:[], shaft:[], wrist:[], gripper:[] };
+  if (!keypointsByInstance[id]) keypointsByInstance[id] = [];
+}
+function getRegionMap(id, region) { ensureInstanceStruct(id); return pointsByInstance[id][region]; }
+function getUndoStack(id, region) { ensureInstanceStruct(id); return undoByInstance[id][region]; }
+function getKPList(id) { ensureInstanceStruct(id); return keypointsByInstance[id]; }
+
+function currentFrameIndex() { return Number($("slider").value || 0); }
+function setActiveRegion(r) {
+  if (!regions.includes(r)) return;
+  activeRegion = r;
+  renderAllLayers();
+}
+function setInstanceId(n) {
+  const v = Math.max(1, parseInt(n || "1", 10));
+  instanceId = v;
+  ensureInstanceStruct(instanceId);
+}
+
+/* ===== 基础加载 ===== */
+async function loadVideos() {
+  const base = $("serverUrl").value.trim();
+  if (!base) return;
+  const sel = $("existing");
+  sel.innerHTML = "";
+  try {
+    const resp = await fetch(`${base}/videos`);
+    if (!resp.ok) throw new Error(await resp.text());
+    const j = await resp.json();
+    (j.videos || []).forEach(v => {
+      const opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      sel.appendChild(opt);
+    });
+    if (sel.options.length === 0) {
+      const opt = document.createElement("option");
+      opt.disabled = true; opt.selected = true;
+      opt.textContent = "(no mp4 in /videos)";
+      sel.appendChild(opt);
+    }
+  } catch (e) {
+    console.error(e);
+    const opt = document.createElement("option");
+    opt.disabled = true; opt.selected = true;
+    opt.textContent = "(failed to query /videos)";
+    sel.appendChild(opt);
+  }
+}
+$("btnRefresh").onclick = loadVideos;
+window.addEventListener("load", loadVideos);
+
+/* ===== 使用/上传/处理 ===== */
+$("btnUse").onclick = async () => {
+  const sel = $("existing");
+  if (!sel.value) return;
+  const base = $("serverUrl").value.trim();
+  const videoId = sel.value;
+  $("videoId").value = videoId;
+
+  const resp = await fetch(`${base}/process_video`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ video_id: videoId, force: false })
+  });
+  if (!resp.ok) { alert("process failed: " + await resp.text()); return; }
+  const j = await resp.json();
+  numFrames = j.num_frames;
+  $("slider").max = String(numFrames - 1);
+  $("slider").value = "0";
+
+  /* 清空所有实例的临时标注（不删磁盘） */
+  for (const k in pointsByInstance) delete pointsByInstance[k];
+  for (const k in undoByInstance)   delete undoByInstance[k];
+  for (const k in keypointsByInstance) delete keypointsByInstance[k];
+  setInstanceId($("instanceId").value);
+
+  $("idxLabel").textContent = `0 / ${numFrames-1}`;
+  maskEl.src = "";
+  await loadFrame(0);
+};
+
+$("btnUpload").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const file = $("videoFile").files[0];
+  if (!base || !file) { alert("fill Server URL & choose .mp4"); return; }
+  const form = new FormData();
+  form.append("file", file);
+  const resp = await fetch(`${base}/upload_video`, { method:"POST", body: form });
+  if (!resp.ok) { alert("upload failed"); return; }
+  const j = await resp.json();
+  $("videoId").value = j.video_id;
+  alert(`✅ Uploaded: ${j.video_id}`);
+  await loadVideos();
+};
+
+$("btnProcess").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  if (!base || !videoId) { alert("fill Server URL & Video ID"); return; }
+  const resp = await fetch(`${base}/process_video`, {
+    method:"POST", headers: { "Content-Type":"application/json" },
+    body: JSON.stringify({ video_id: videoId, force: false })
+  });
+  if (!resp.ok) { alert("process failed: " + await resp.text()); return; }
+  const j = await resp.json();
+  numFrames = j.num_frames;
+  $("slider").max = String(numFrames - 1);
+  $("slider").value = "0";
+
+  for (const k in pointsByInstance) delete pointsByInstance[k];
+  for (const k in undoByInstance)   delete undoByInstance[k];
+  for (const k in keypointsByInstance) delete keypointsByInstance[k];
+  setInstanceId($("instanceId").value);
+
+  $("idxLabel").textContent = `0 / ${numFrames-1}`;
+  maskEl.src = "";
+  await loadFrame(0);
+};
+
+/* ===== 区域/实例切换 ===== */
+$("region").addEventListener("change", async e => {
+  setActiveRegion(e.target.value);
+  await callResetIfPossible();
+  await loadFrame(currentFrameIndex());
+});
+
+$("instanceId").addEventListener("change", async e => {
+  setInstanceId(e.target.value);
+  await callResetIfPossible();
+  maskEl.src = "";
+  renderAllLayers();
+  await loadFrame(currentFrameIndex());
+});
+
+async function callResetIfPossible() {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  if (base && videoId) {
+    try {
+      await fetch(`${base}/sam2/reset`, {
+        method: "POST",
+        headers: { "Content-Type":"application/json" },
+        body: JSON.stringify({ video_id: videoId })
+      });
+    } catch (err) { console.error("reset failed:", err); }
+  }
+}
+
+/* ===== 滑块/图片加载 ===== */
+$("slider").addEventListener("input", async e => {
+  const idx = Number(e.target.value);
+  $("idxLabel").textContent = `${idx} / ${numFrames-1}`;
+  maskEl.src = "";     // 切帧时清掉上一帧叠加
+  await loadFrame(idx);
+});
+
+imgEl.addEventListener("load", () => {
+  overlay.width  = imgEl.clientWidth;
+  overlay.height = imgEl.clientHeight;
+  renderAllLayers();
+});
+
+/* ===== 统计与坐标转换 ===== */
+function updateCountsUI() {
+  const idx = currentFrameIndex();
+  const regionMap = getRegionMap(instanceId, activeRegion);
+  const rec = regionMap[idx] || {pos:[], neg:[]};
+  $("counts").textContent = `inst=${instanceId}, region=${activeRegion} | pos: ${rec.pos.length}, neg: ${rec.neg.length}`;
+  const kpList = getKPList(instanceId);
+  $("kpCounts").textContent = `inst=${instanceId} | keypoints: ${kpList.length}`;
+}
+function getDisplayScale() {
+  const sx = imgEl.clientWidth  / (imgEl.naturalWidth  || imgEl.clientWidth  || 1);
+  const sy = imgEl.clientHeight / (imgEl.naturalHeight || imgEl.clientHeight || 1);
+  return { sx, sy };
+}
+function toImageCoords(clientX, clientY) {
+  const rect = imgEl.getBoundingClientRect();
+  const x_disp = clientX - rect.left;
+  const y_disp = clientY - rect.top;
+  const sx = (imgEl.naturalWidth  || imgEl.clientWidth  || 1) / (imgEl.clientWidth  || 1);
+  const sy = (imgEl.naturalHeight || imgEl.clientHeight || 1) / (imgEl.clientHeight || 1);
+  const x_img = Math.round(Math.max(0, Math.min(x_disp * sx, (imgEl.naturalWidth  || 1) - 1)));
+  const y_img = Math.round(Math.max(0, Math.min(y_disp * sy, (imgEl.naturalHeight || 1) - 1)));
+  return { x: x_img, y: y_img };
+}
+
+/* ===== 绘制点/关键点（顶层 canvas） ===== */
+function renderAllLayers() {
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  const scale = getDisplayScale();
+  const r = DOT_RADIUS_DISPLAY;
+
+  // 分割点
+  const regionMap = getRegionMap(instanceId, activeRegion);
+  const idx = currentFrameIndex();
+  const rec = regionMap[idx];
+  if (rec) {
+    // 正样本（蓝）
+    ctx.fillStyle = "rgba(0, 122, 255, 0.9)";
+    ctx.strokeStyle = "white";
+    ctx.lineWidth = 2;
+    for (const p of rec.pos) {
+      const x = p.x * scale.sx, y = p.y * scale.sy;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+    // 负样本（红）
+    ctx.fillStyle = "rgba(255, 59, 48, 0.9)";
+    ctx.strokeStyle = "white";
+    ctx.lineWidth = 2;
+    for (const p of rec.neg) {
+      const x = p.x * scale.sx, y = p.y * scale.sy;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    }
+  }
+
+  // 关键点（紫）
+  const kpList = getKPList(instanceId);
+  ctx.fillStyle = "rgba(128, 0, 255, 0.95)";
+  ctx.strokeStyle = "white";
+  ctx.lineWidth = 2;
+  for (const kp of kpList) {
+    if (kp.frame_index !== idx) continue;
+    const x = kp.x * scale.sx, y = kp.y * scale.sy;
+    ctx.beginPath(); ctx.arc(x, y, KP_RADIUS_DISPLAY, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    if (kp.name) {
+      ctx.font = "12px system-ui";
+      ctx.fillStyle = "rgba(0,0,0,0.7)";
+      ctx.fillText(kp.name, x + 6, y - 6);
+      ctx.fillStyle = "rgba(128, 0, 255, 0.95)";
+    }
+  }
+
+  updateCountsUI();
+}
+
+/* ===== 右键菜单禁用（用于负样本） ===== */
+imgEl.addEventListener("contextmenu", e => e.preventDefault());
+
+/* ===== 点击：分割点 or 关键点 ===== */
+imgEl.addEventListener("mousedown", (e) => {
+  if (!imgEl.naturalWidth || !imgEl.complete) return;
+  const idx = currentFrameIndex();
+  const pt = toImageCoords(e.clientX, e.clientY);
+
+  if (keypointMode) {
+    // 关键点：只用左键；右键忽略
+    if (e.button === 0) {
+      const name = $("kpName").value.trim() || null;
+      const list = getKPList(instanceId);
+      list.push({ frame_index: idx, x: pt.x, y: pt.y, name });
+      renderAllLayers();
+    }
+    return;
+  }
+
+  // 分割点模式
+  const regionMap = getRegionMap(instanceId, activeRegion);
+  regionMap[idx] ??= { pos: [], neg: [] };
+  const isRight = (e.button === 2);
+  const isShiftLeftAsNeg = (e.button === 0 && e.shiftKey);
+
+  const stack = getUndoStack(instanceId, activeRegion);
+  if (isRight || isShiftLeftAsNeg) {
+    regionMap[idx].neg.push(pt); stack.push({ frame: idx, type: 'neg' });
+  } else if (e.button === 0) {
+    regionMap[idx].pos.push(pt); stack.push({ frame: idx, type: 'pos' });
+  } else { return; }
+
+  renderAllLayers();
+  sendClickToSam2().catch(console.error);
+});
+
+/* ===== 撤销/清空/导出/保存/加载/跟踪 ===== */
+$("btnUndo").onclick = () => {
+  if (keypointMode) {
+    // 关键点撤销：撤当前帧最后一个
+    const idx = currentFrameIndex();
+    const list = getKPList(instanceId);
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].frame_index === idx) { list.splice(i, 1); break; }
+    }
+    renderAllLayers();
+    return;
+  }
+  const stack = getUndoStack(instanceId, activeRegion);
+  if (!stack.length) return;
+  const rec = stack.pop();
+  const regionMap = getRegionMap(instanceId, activeRegion);
+  const bucket = regionMap[rec.frame]?.[rec.type];
+  if (bucket && bucket.length) {
+    bucket.pop();
+    if (rec.frame === currentFrameIndex()) renderAllLayers();
+    else updateCountsUI();
+  }
+};
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === 'u' || e.key === 'U') { e.preventDefault(); $("btnUndo").click(); }
+});
+
+$("btnClear").onclick = () => {
+  const idx = currentFrameIndex();
+  if (keypointMode) {
+    const list = getKPList(instanceId);
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].frame_index === idx) list.splice(i, 1);
+    renderAllLayers();
+    return;
+  }
+  const regionMap = getRegionMap(instanceId, activeRegion);
+  if (!regionMap[idx]) return;
+  regionMap[idx] = { pos: [], neg: [] };
+  renderAllLayers();
+  maskEl.src = ""; // 清叠加
+};
+
+$("btnExport").onclick = () => {
+  const videoId = $("videoId").value.trim();
+  const region = $("region").value;
+  const regionMap = getRegionMap(instanceId, region);
+  const payload = { video_id: videoId || null, instance_id: instanceId, region, num_frames: numFrames, annotations: regionMap };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type: "application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (videoId ? `${videoId}.` : "") + `instance${instanceId}.points_${region}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+$("btnSave").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  const region = $("region").value;
+  if (!base || !videoId) { alert("fill Server URL & Video ID"); return; }
+  const regionMap = getRegionMap(instanceId, region);
+  const prompts = [];
+  Object.entries(regionMap).forEach(([frameStr, rec]) => {
+    const frame = Number(frameStr);
+    if (!rec) return;
+    (rec.pos || []).forEach(p => prompts.push({ frame_index: frame, x: p.x, y: p.y, label: 1 }));
+    (rec.neg || []).forEach(p => prompts.push({ frame_index: frame, x: p.x, y: p.y, label: 0 }));
+  });
+  const payload = { video_id: videoId, region, prompts };
+  const resp = await fetch(`${base}/save_points?region=${encodeURIComponent(region)}&instance_id=${instanceId}`, {
+    method: "POST", headers: { "Content-Type":"application/json" }, body: JSON.stringify(payload)
+  });
+  if (!resp.ok) { alert("save_points failed: " + await resp.text()); return; }
+  const j = await resp.json();
+  alert(`✅ saved ${j.saved} prompts to ${j.path}`);
+};
+
+let trackTimer = null;
+$("btnTrack").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  const region = $("region").value;
+  if (!base || !videoId) { alert("fill Server URL & Video ID"); return; }
+  const resp = await fetch(`${base}/sam2/track/start?instance_id=${instanceId}`, {
+    method: "POST", headers: { "Content-Type":"application/json" },
+    body: JSON.stringify({ video_id: videoId, region })
+  });
+  if (!resp.ok) { alert("track start failed: " + await resp.text()); return; }
+  $("trackStatus").textContent = "tracking started…";
+  if (trackTimer) clearInterval(trackTimer);
+  trackTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`${base}/sam2/track/status?video_id=${encodeURIComponent(videoId)}&region=${encodeURIComponent(region)}&instance_id=${instanceId}`);
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j.state === "running") {
+        $("trackStatus").textContent = `tracking: ${j.current}/${j.total}`;
+        const idx = currentFrameIndex();
+        if (idx < j.current) await loadFrame(idx);
+      } else if (j.state === "done") {
+        $("trackStatus").textContent = `✅ done: ${j.total}/${j.total}`;
+        clearInterval(trackTimer); trackTimer = null;
+        await loadFrame(currentFrameIndex());
+      } else if (j.state === "error") {
+        $("trackStatus").textContent = `❌ error: ${j.message}`;
+        clearInterval(trackTimer); trackTimer = null;
+      } else {
+        $("trackStatus").textContent = "";
+        clearInterval(trackTimer); trackTimer = null;
+      }
+    } catch (e) { console.error(e); }
+  }, 700);
+};
+
+$("btnLoad").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  const region = $("region").value;
+  if (!base || !videoId) { alert("fill Server URL & Video ID"); return; }
+  const resp = await fetch(`${base}/load_points?video_id=${encodeURIComponent(videoId)}&region=${encodeURIComponent(region)}&instance_id=${instanceId}`);
+  if (!resp.ok) { alert("load_points failed: " + await resp.text()); return; }
+  const j = await resp.json();
+  const rec = {};
+  (j.prompts || []).forEach(p => {
+    const f = Number(p.frame_index);
+    rec[f] ??= { pos: [], neg: [] };
+    const pt = { x: Number(p.x), y: Number(p.y) };
+    if (Number(p.label) === 1) rec[f].pos.push(pt); else rec[f].neg.push(pt);
+  });
+  ensureInstanceStruct(instanceId);
+  pointsByInstance[instanceId][region] = rec;
+  undoByInstance[instanceId][region] = [];
+  renderAllLayers();
+  alert(`✅ loaded ${ (j.prompts || []).length } prompts for inst=${instanceId}, region="${region}".`);
+};
+
+/* ===== Keypoint 相关 ===== */
+$("btnToggleKP").onclick = () => {
+  keypointMode = !keypointMode;
+  $("btnToggleKP").textContent = `Keypoint Mode: ${keypointMode ? "ON" : "OFF"}`;
+  $("btnToggleKP").classList.toggle("mode-on", keypointMode);
+};
+
+$("btnKPSave").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  if (!base || !videoId) { alert("fill Server URL & Video ID"); return; }
+  const list = getKPList(instanceId);
+  if (!list.length) { alert("No keypoints to save"); return; }
+  const payload = { video_id: videoId, keypoints: list };
+  const resp = await fetch(`${base}/save_keypoints?instance_id=${instanceId}`, {
+    method: "POST",
+    headers: { "Content-Type":"application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!resp.ok) { alert("save_keypoints failed: " + await resp.text()); return; }
+  const j = await resp.json();
+  alert(`✅ saved ${j.saved} keypoints to ${j.path}`);
+};
+
+$("btnKPLoad").onclick = async () => {
+  const base = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  if (!base || !videoId) { alert("fill Server URL & Video ID"); return; }
+  const resp = await fetch(`${base}/load_keypoints?video_id=${encodeURIComponent(videoId)}&instance_id=${instanceId}`);
+  if (!resp.ok) { alert("load_keypoints failed: " + await resp.text()); return; }
+  const j = await resp.json();
+  const list = Array.isArray(j.keypoints) ? j.keypoints.map(k => ({
+    frame_index: Number(k.frame_index),
+    x: Number(k.x),
+    y: Number(k.y),
+    name: (k.name ?? null)
+  })) : [];
+  ensureInstanceStruct(instanceId);
+  keypointsByInstance[instanceId] = list;
+  renderAllLayers();
+  alert(`✅ loaded ${list.length} keypoints for inst=${instanceId}.`);
+};
+
+/* ===== 帧/遮罩加载（含预取 + 破缓存）===== */
+let lastMaskVersionTick = 0; // add_points 后更新，用于破缓存
+function prefetchImageSafely(makeUrl, i) {
+  if (typeof numFrames !== "number") return;
+  if (i < 0 || i >= numFrames) return;
+  const img = new Image();
+  img.src = makeUrl(i);
+}
+
+async function loadFrame(idx) {
+  const base    = $("serverUrl").value.trim();
+  const videoId = $("videoId").value.trim();
+  const region  = $("region").value;
+  const inst    = instanceId;
+  if (!base || !videoId || Number.isNaN(idx)) return;
+
+  // 背景帧
+  const makeFrameUrl = (i) => `${base}/frame?video_id=${encodeURIComponent(videoId)}&index=${i}`;
+  imgEl.src = makeFrameUrl(idx);
+
+  // 探测 mask（HEAD）
+  const maskHeadUrl = `${base}/mask?video_id=${encodeURIComponent(videoId)}&frame_index=${idx}&region=${encodeURIComponent(region)}&instance_id=${inst}`;
+  try {
+    const head = await fetch(maskHeadUrl, { method: "HEAD" });
+    if (head.ok) {
+      const core = `${maskHeadUrl}&rgba=1&a=128&r=0&g=255&b=0`;
+      const url  = lastMaskVersionTick ? `${core}&v=${lastMaskVersionTick}` : core;
+      maskEl.style.display = "block";
+      maskEl.src = url;
+    } else {
+      maskEl.style.display = "none";
+      maskEl.src = "";
+    }
+  } catch {
+    maskEl.style.display = "none";
+    maskEl.src = "";
+  }
+
+  // 预取
+  prefetchImageSafely(makeFrameUrl, idx + 1);
+  prefetchImageSafely(makeFrameUrl, idx - 1);
+  const makeMaskUrl = (i) => `${base}/mask?video_id=${encodeURIComponent(videoId)}&frame_index=${i}&region=${encodeURIComponent(region)}&instance_id=${inst}&rgba=1&a=128&r=0&g=255&b=0`;
+  prefetchImageSafely(makeMaskUrl, idx + 1);
+  prefetchImageSafely(makeMaskUrl, idx - 1);
+}
+
+async function sendClickToSam2() {
+  const base   = $("serverUrl").value.trim();
+  const videoId= $("videoId").value.trim();
+  const region = $("region").value;
+  const frame  = Number($("slider").value);
+  const inst   = instanceId;
+  if (!base || !videoId) return;
+
+  const regionMap = getRegionMap(inst, region);
+  const rec = regionMap[frame] || {pos:[], neg:[]};
+  const points = [
+    ...rec.pos.map(p => ({ x:p.x, y:p.y, label:1 })),
+    ...rec.neg.map(p => ({ x:p.x, y:p.y, label:0 })),
+  ];
+
+  const resp = await fetch(`${base}/sam2/add_points?instance_id=${inst}`, {
+    method: "POST", headers: { "Content-Type":"application/json" },
+    body: JSON.stringify({ video_id: videoId, frame_index: frame, region, points })
+  });
+  if (!resp.ok) { console.error(await resp.text()); return; }
+  await resp.json(); // 仅确认
+
+  lastMaskVersionTick = Date.now(); // 破缓存
+  await loadFrame(frame);
+}
+</script>
+</body>
+</html>
