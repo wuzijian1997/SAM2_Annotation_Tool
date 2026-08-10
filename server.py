@@ -51,8 +51,8 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 # SAM2
 # ==============================
 SAM2_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAM2_CFG = str("configs/sam2.1/sam2.1_hiera_l.yaml")
-SAM2_CKPT = str((ROOT / "checkpoints" / "sam2.1_hiera_large.pt").resolve())
+SAM2_CFG = str("configs/sam2.1/sam2.1_hiera_b+.yaml")
+SAM2_CKPT = str((ROOT / "checkpoints" / "checkpoint.pt").resolve())
 
 SAM2_PREDICTOR = None              # 模型本体
 SAM2_LOCK = asyncio.Lock()         # GPU 互斥
